@@ -5,7 +5,7 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 name = "langchain-vdms"
 version = "0.1.0"
-description = "An integration package connecting Vdms and LangChain"
+description = "An integration package connecting VDMS and LangChain"
 authors = []
 readme = "README.md"
 repository = "https://github.com/langchain-ai/langchain"
@@ -13,6 +13,9 @@ license = "MIT"
 
 [tool.mypy]
 disallow_untyped_defs = "True"
+[[tool.mypy.overrides]]
+module = ["vdms", "simsimd"]
+ignore_missing_imports = "True"
 
 [tool.poetry.urls]
 "Source Code" = "https://github.com/langchain-ai/langchain/tree/master/libs/partners/vdms"
@@ -58,7 +61,7 @@ pytest = "^7.4.3"
 pytest-asyncio = "^0.23.2"
 pytest-socket = "^0.7.0"
 pytest-watcher = "^0.3.4"
-langchain-tests = "^0.3.5"
+langchain-tests = "^0.3.11"
 
 [tool.poetry.group.codespell.dependencies]
 codespell = "^2.2.6"

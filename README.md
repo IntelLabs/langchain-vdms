@@ -1,6 +1,6 @@
 # langchain-vdms
 
-This package contains the LangChain integration with Vdms
+This package contains the LangChain integration with [VDMS](https://github.com/IntelLabs/vdms).
 
 ## Installation
 
@@ -8,38 +8,46 @@ This package contains the LangChain integration with Vdms
 pip install -U langchain-vdms
 ```
 
-And you should configure credentials by setting the following environment variables:
+<!-- And you should configure credentials by setting the following environment variables:
 
-* TODO: fill this out
+* TODO: fill this out -->
 
-## Chat Models
 
-`ChatVdms` class exposes chat models from Vdms.
+## VDMS vector database
 
-```python
-from langchain_vdms import ChatVdms
-
-llm = ChatVdms()
-llm.invoke("Sing a ballad of LangChain.")
-```
-
-## Embeddings
-
-`VdmsEmbeddings` class exposes embeddings from Vdms.
+The ``VDMS`` class exposes the VDMS vector store.
 
 ```python
-from langchain_vdms import VdmsEmbeddings
-
-embeddings = VdmsEmbeddings()
-embeddings.embed_query("What is the meaning of life?")
+from langchain_vdms import VDMS
 ```
+<br>
 
-## LLMs
-`VdmsLLM` class exposes LLMs from Vdms.
+The ``VDMS_Client`` function connects to VDMS server using VDMS client.
 
 ```python
-from langchain_vdms import VdmsLLM
-
-llm = VdmsLLM()
-llm.invoke("The meaning of life is")
+from langchain_vdms.vectorstores import VDMS_Client
 ```
+<br>
+
+The ``VDMS_Utils`` class exposes a utility with helpful functions related to VDMS.
+
+```python
+from langchain_vdms.vectorstores import VDMS_Utils
+```
+
+## Example Usage
+```python
+from langchain_vdms.vectorstores import VDMS, VDMS_Client
+
+embeddings = ... # use a LangChain Embeddings class
+
+vectorstore_client = VDMS_Client("localhost", 55555)
+vectorstore = VDMS(
+    client=vectorstore_client,
+    collection_name="foo",
+    embedding=embeddings,
+    engine="FaissFlat",
+    distance_strategy="L2",
+)
+```
+See additional usage [here](https://python.langchain.com/docs/integrations/vectorstores/vdms/).
