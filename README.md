@@ -36,6 +36,7 @@ from langchain_vdms.vectorstores import VDMS_Utils
 ```
 
 ## Example Usage
+This example initiates the VDMS vector store and uses the VDMS Client to connect to a VDMS server on `localhost` using port `55555`.
 ```python
 from langchain_vdms.vectorstores import VDMS, VDMS_Client
 
