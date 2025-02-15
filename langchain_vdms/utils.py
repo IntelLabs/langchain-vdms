@@ -84,7 +84,7 @@ def cosine_similarity(X: Matrix, Y: Matrix) -> np.ndarray:
         return similarity
 
 
-def _len_check_if_sized(x: Any, y: Any, x_name: str, y_name: str) -> None:
+def check_if_same_size(x: Any, y: Any, x_name: str, y_name: str) -> None:
     """
     Check that sizes of two variables are the same
 

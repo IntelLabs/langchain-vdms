@@ -33,7 +33,7 @@ from langchain_core.indexing import UpsertResponse
 from langchain_core.vectorstores import VectorStore
 
 from langchain_vdms.utils import (
-    _len_check_if_sized,
+    check_if_same_size,
     encode_image,
     maximal_marginal_relevance,
     reorder_mmr_documents,
@@ -876,13 +876,13 @@ class VDMS(VectorStore):
         metadatas: Optional[list[dict]] = None,
         ids: Optional[list[str]] = None,
     ) -> list:
-        _len_check_if_sized(texts, embeddings, "texts", "embeddings")
+        check_if_same_size(texts, embeddings, "texts", "embeddings")
 
         metadatas = metadatas if metadatas is not None else [{} for _ in texts]
-        _len_check_if_sized(texts, metadatas, "texts", "metadatas")
+        check_if_same_size(texts, metadatas, "texts", "metadatas")
 
         ids = ids if ids is not None else [str(uuid.uuid4()) for _ in texts]
-        _len_check_if_sized(texts, ids, "texts", "ids")
+        check_if_same_size(texts, ids, "texts", "ids")
 
         extended_emb: list[Any] = []
         batch_properties: list[dict] = []
