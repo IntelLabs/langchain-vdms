@@ -1,10 +1,9 @@
 import logging
 import os
 import uuid
-from typing import Generator
 
 import pytest
-from langchain_core.vectorstores import VectorStore
+from langchain_core.documents import Document
 from langchain_tests.integration_tests import VectorStoreIntegrationTests
 
 from langchain_vdms.vectorstores import VDMS, VDMS_Client
@@ -18,7 +17,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 class TestVdmsVectorStoreSync(VectorStoreIntegrationTests):
     @pytest.fixture()
-    def vectorstore(self) -> Generator[VectorStore, None, None]:  # type: ignore
+    def vectorstore(self) -> VDMS:  # type: ignore
         """Get an empty vectorstore for unit tests."""
         test_name = uuid.uuid4().hex
         client = VDMS_Client(
@@ -38,3 +37,37 @@ class TestVdmsVectorStoreSync(VectorStoreIntegrationTests):
             # cleanup operations, or deleting data
             # logic is executed in between each test
             pass
+
+    @property
+    def has_async(self) -> bool:
+        """
+        Configurable property to enable or disable async tests.
+        """
+        return False
+
+    @pytest.mark.xfail(
+        reason="add_documents can duplicate ids; upsert used for idempotent ids"
+    )
+    def test_add_documents_with_ids_is_idempotent(self, vectorstore: VDMS) -> None:  # type: ignore[override]
+        """Adding by ID should be idempotent.
+
+        .. dropdown:: Troubleshooting
+
+            If this test fails, check that adding the same document twice with the
+            same IDs has the same effect as adding it once (i.e., it does not
+            duplicate the documents).
+        """
+        if not self.has_sync:
+            pytest.skip("Sync tests not supported.")
+
+        documents = [
+            Document(page_content="foo", metadata={"id": 1}),
+            Document(page_content="bar", metadata={"id": 2}),
+        ]
+        vectorstore.add_documents(documents, ids=["1", "2"])
+        vectorstore.upsert(documents, ids=["1", "2"])
+        documents = vectorstore.similarity_search("bar", k=2)
+        assert documents == [
+            Document(page_content="bar", metadata={"id": 2}, id="2"),
+            Document(page_content="foo", metadata={"id": 1}, id="1"),
+        ]

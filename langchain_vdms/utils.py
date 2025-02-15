@@ -7,9 +7,16 @@ are duplicated in this utility respectively from LangChain modules:
     - "libs/community/langchain_community/utils/math.py"
 """
 
-from typing import List, Union
+import base64
+from typing import (
+    Any,
+    List,
+    Sized,
+    Union,
+)
 
 import numpy as np
+from langchain_core.documents import Document
 
 Matrix = Union[List[List[float]], List[np.ndarray], np.ndarray]
 
@@ -75,3 +82,46 @@ def cosine_similarity(X: Matrix, Y: Matrix) -> np.ndarray:
             similarity = np.dot(X, Y.T) / np.outer(X_norm, Y_norm)
         similarity[np.isnan(similarity) | np.isinf(similarity)] = 0.0
         return similarity
+
+
+def _len_check_if_sized(x: Any, y: Any, x_name: str, y_name: str) -> None:
+    """
+    Check that sizes of two variables are the same
+
+    Args:
+        x: Variable to compare
+        y: Variable to compare
+        x_name: Name for variable x
+        y_name: Name for variable y
+    """
+    if isinstance(x, Sized) and isinstance(y, Sized) and len(x) != len(y):
+        raise ValueError(
+            f"{x_name} and {y_name} expected to be equal length but "
+            f"len({x_name})={len(x)} and len({y_name})={len(y)}"
+        )
+    return
+
+
+def encode_image(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        blob = f.read()
+        return base64.b64encode(blob).decode("utf-8")
+
+
+def decode_image(base64_image: str) -> bytes:
+    return base64.b64decode(base64_image)
+
+
+def reorder_mmr_documents(
+    documents: Union[list[Document], list[tuple[Document, float]]],
+    mmr_selected: list[int],
+) -> list[Any]:
+    # Reorder the values and return.
+    reordered_docs = []
+    for idx in mmr_selected:
+        # Function can return -1 index
+        if idx == -1:
+            break
+        else:
+            reordered_docs.append(documents[idx])
+    return reordered_docs

@@ -5,7 +5,6 @@ It contains the VDMS class which is a vector store for handling various tasks.
 
 from __future__ import annotations
 
-import base64
 import logging
 import time
 import uuid
@@ -16,24 +15,29 @@ from typing import (
     Callable,
     Iterable,
     List,
-    Literal,  # Added
+    Literal,
     Optional,
     Sequence,
-    Sized,
     Tuple,
     Type,
     TypeVar,
-    Union,  # Added
-    get_args,  # Added
+    Union,
+    get_args,
 )
 
 import numpy as np
 import vdms
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+from langchain_core.indexing import UpsertResponse
 from langchain_core.vectorstores import VectorStore
 
-from langchain_vdms.utils import maximal_marginal_relevance
+from langchain_vdms.utils import (
+    _len_check_if_sized,
+    encode_image,
+    maximal_marginal_relevance,
+    reorder_mmr_documents,
+)
 
 VST = TypeVar("VST", bound=VectorStore)
 
@@ -235,13 +239,232 @@ class VDMS(VectorStore):
         # Initialize collection
         self._create_collection()
 
+    def _select_relevance_score_fn(self) -> Callable[[float], float]:
+        """
+        The 'correct' relevance function
+        may differ depending on a few things, including:
+        - the distance / similarity metric used by the VectorStore
+        - the scale of your embeddings (OpenAI's are unit normed. Many others are not!)
+        - embedding dimensionality
+        - etc.
+        """
+        if self.override_relevance_score_fn is not None:
+            return self.override_relevance_score_fn
+
+        # Default strategy is to rely on distance strategy provided
+        # in vector store constructor
+        if self.distance_strategy.lower() in ["ip", "l2"]:
+            return lambda x: x
+        else:
+            raise ValueError(
+                "No supported normalization function"
+                f" for distance_strategy of {self.distance_strategy}."
+                "Consider providing relevance_score_fn to VDMS constructor."
+            )
+
+    def _check_required_inputs(
+        self,
+        collection_name: str,
+        embedding_dimensions: Union[int, None],
+        **kwargs: Any,
+    ) -> None:
+        # Check Distance Metric
+        if self.distance_strategy not in AVAILABLE_DISTANCE_METRICS:
+            raise ValueError("distance_strategy must be either 'L2' or 'IP'")
+
+        # Check Engines
+        if self.similarity_search_engine not in AVAILABLE_ENGINES:
+            raise ValueError(
+                "engine must be either 'TileDBDense', 'TileDBSparse', "
+                + "'FaissFlat', 'FaissIVFFlat', 'FaissHNSWFlat', or 'Flinng'"
+            )
+
+        # Check Embedding Func is provided and store dimension size
+        if self.embedding is None:
+            raise ValueError("Must provide embedding function")
+
+        if embedding_dimensions is not None:
+            self.embedding_dimension = embedding_dimensions
+        elif self.embedding is not None and hasattr(self.embedding, "embed_query"):
+            self.embedding_dimension = len(
+                self.embedding.embed_query("This is a sample sentence.")
+            )
+        elif self.embedding is not None and (
+            hasattr(self.embedding, "embed_image")
+            or hasattr(self.embedding, "embed_video")
+        ):
+            dim_err_str = "Please define embedding_dimensions"
+            if hasattr(self.embedding, "model"):
+                try:
+                    self.embedding_dimension = (
+                        self.embedding.model.token_embedding.embedding_dim
+                    )
+                except ValueError:
+                    raise ValueError(dim_err_str)
+            else:
+                raise ValueError(dim_err_str)
+
+        # Check for properties
+        current_props = self.utils.get_properties(collection_name)
+        if hasattr(self, "collection_properties"):
+            missing_elements = list(
+                set(current_props) - set(self.collection_properties)
+            )  # element in current not in props
+            if len(missing_elements) > 0:
+                self.collection_properties.extend(missing_elements)
+        else:
+            self.collection_properties: list[str] = current_props
+
+        self.collection_properties.sort()
+
+    def _create_collection(self) -> None:
+        collection_name = self.collection_name
+        embedding_dimension = self.embedding_dimension
+        engine = self.similarity_search_engine
+        metric = self.distance_strategy
+
+        query = self.utils.add_descriptor_set(
+            "AddDescriptorSet",
+            collection_name,
+            embedding_dimension,
+            engine=getattr(engine, "value", engine),
+            metric=getattr(metric, "value", metric),
+        )
+
+        response, _ = self.utils.run_vdms_query([query])
+
+        if "FailedCommand" in response[0]:
+            raise ValueError(f"Failed to add collection {collection_name}")
+
+        if response[0]["AddDescriptorSet"]["status"] == 0:
+            status = "created"
+        else:
+            status = "exists"
+
+        logger.info(f"Descriptor set {collection_name} {status}")
+
+    @property
+    def embeddings(self) -> Embeddings:
+        return self.embedding
+
+    """ DELETE """
+
+    def batch_delete(
+        self,
+        collection_name: str,
+        constraints: dict,
+        ids: Optional[list[str]] = None,
+        batch_size: int = DEFAULT_INSERT_BATCH_SIZE,
+    ) -> list:
+        resp_dict: dict = {}
+        resp_dict.setdefault(
+            "FindDescriptor", {"entities": list(), "returned": 0, "status": 0}
+        )
+        new_response = [resp_dict]
+
+        if ids is None:
+            # FIND ALL
+            query = self.utils.add_descriptor(
+                "FindDescriptor",
+                collection_name,
+                label=None,
+                ref=None,
+                props=None,
+                link=None,
+                k_neighbors=None,
+                constraints=constraints,
+                results={"list": self.collection_properties},
+            )
+            response, _ = self.utils.run_vdms_query([query])
+
+            for res in response:
+                if "FindDescriptor" in res:
+                    new_response[0]["FindDescriptor"]["entities"].extend(
+                        res["FindDescriptor"]["entities"]
+                    )
+        else:
+            for start_idx in range(0, len(ids), batch_size):
+                end_idx = min(start_idx + batch_size, len(ids))
+                batch_ids = ids[start_idx:end_idx]
+
+                all_queries = []
+                for i in batch_ids:
+                    tmp_ = {LANGCHAIN_ID_PROPERTY: ["==", i]}
+                    if constraints is not None:
+                        tmp_.update(constraints)
+
+                    query = self.utils.add_descriptor(
+                        "FindDescriptor",
+                        collection_name,
+                        label=None,
+                        ref=None,
+                        props=None,
+                        link=None,
+                        k_neighbors=None,
+                        constraints=tmp_,
+                        results={"list": self.collection_properties},
+                    )
+
+                    all_queries.append(query)
+
+                if all_queries == []:
+                    return new_response
+
+                response, _ = self.utils.run_vdms_query(all_queries)
+
+                for res in response:
+                    if "FindDescriptor" in res:
+                        new_response[0]["FindDescriptor"]["entities"].extend(
+                            res["FindDescriptor"]["entities"]
+                        )
+
+        new_response[0]["FindDescriptor"]["returned"] = len(
+            new_response[0]["FindDescriptor"]["entities"]
+        )
+
+        # Update/store indices after deletion
+        query = self.utils.add_descriptor_set(
+            "FindDescriptorSet", collection_name, storeIndex=True
+        )
+        _, _ = self.utils.run_vdms_query([query])
+        return new_response
+
+    def delete(self, ids: Optional[List[str]] = None, **kwargs: Any) -> Optional[bool]:
+        """Delete by vector ID or other criteria.
+
+        Args:
+            ids: List of ids to delete. If None, delete all. Default is None.
+            **kwargs: Other keyword arguments that subclasses might use.
+
+        Returns:
+            Optional[bool]: True if deletion is successful, False otherwise
+        """
+
+        collection_name = kwargs.pop("collection_name", self.collection_name)
+
+        if "constraints" in kwargs and isinstance(kwargs["constraints"], dict):
+            constraints = kwargs.pop("constraints")
+            constraints["_deletion"] = ["==", 1]
+        else:
+            constraints = {"_deletion": ["==", 1]}
+
+        response = self.batch_delete(
+            collection_name,
+            constraints,
+            ids,
+            batch_size=kwargs.get("batch_size", DEFAULT_INSERT_BATCH_SIZE),
+        )
+
+        return "FindDescriptor" in response[0]
+
+    """ ADD/UPDATE """
+
     def add_texts(
         self,
         texts: Iterable[str],
         metadatas: Optional[List[dict]] = None,
         **kwargs: Any,
     ) -> List[str]:
-        # raise NotImplementedError
         """Run texts through the embeddings function and add to the vector store.
 
         Args:
@@ -271,309 +494,6 @@ class VDMS(VectorStore):
             **kwargs,
         )
 
-    # optional: add custom async implementations
-    # async def aadd_texts(
-    #     self,
-    #     texts: Iterable[str],
-    #     metadatas: Optional[List[dict]] = None,
-    #     **kwargs: Any,
-    # ) -> List[str]:
-    #     return await asyncio.get_running_loop().run_in_executor(
-    #         None, partial(self.add_texts, **kwargs), texts, metadatas
-    #     )
-
-    def delete(self, ids: Optional[List[str]] = None, **kwargs: Any) -> Optional[bool]:
-        # raise NotImplementedError
-        """Delete by vector ID or other criteria.
-
-        Args:
-            ids: List of ids to delete. If None, delete all. Default is None.
-            **kwargs: Other keyword arguments that subclasses might use.
-
-        Returns:
-            Optional[bool]: True if deletion is successful, False otherwise
-        """
-
-        collection_name = kwargs.pop("collection_name", self.collection_name)
-
-        if "constraints" in kwargs and isinstance(kwargs["constraints"], dict):
-            constraints = kwargs.pop("constraints")
-            constraints["_deletion"] = ["==", 1]
-        else:
-            constraints = {"_deletion": ["==", 1]}
-
-        response = self.batch_delete(
-            collection_name,
-            constraints,
-            ids,
-            batch_size=kwargs.get("batch_size", DEFAULT_INSERT_BATCH_SIZE),
-        )
-
-        # Update/store indices after deletion
-        query = self.utils.add_descriptor_set(
-            "FindDescriptorSet", collection_name, storeIndex=True
-        )
-        _, _ = self.utils.run_vdms_query([query])
-
-        return "FindDescriptor" in response[0]
-
-    # optional: add custom async implementations
-    # async def adelete(
-    #     self, ids: Optional[List[str]] = None, **kwargs: Any
-    # ) -> Optional[bool]:
-    #     raise NotImplementedError
-
-    def similarity_search(
-        self,
-        query: str,
-        k: int = DEFAULT_K,
-        fetch_k: int = DEFAULT_FETCH_K,
-        filter: Optional[dict[str, List]] = None,
-        **kwargs: Any,
-    ) -> List[Document]:
-        # raise NotImplementedError
-        """Return docs most similar to query.
-
-        Args:
-            query: Query string to search for.
-            k: Number of Documents to return.
-            fetch_k: Number of candidates to fetch for knn (>= k).
-            filter: Filter by metadata. Defaults to None.
-            **kwargs: Arguments to pass to the search method.
-
-        Returns:
-            List of Documents most similar to the query.
-        """
-        assert self.embedding is not None, "Embedding function is not set"
-        query_embedding = self.get_embedding_from_query(query)
-        return self.similarity_search_by_vector(
-            query_embedding, k, fetch_k=fetch_k, filter=filter, **kwargs
-        )
-
-    # optional: add custom async implementations
-    # async def asimilarity_search(
-    #     self, query: str, k: int = 4, **kwargs: Any
-    # ) -> List[Document]:
-    #     # This is a temporary workaround to make the similarity search
-    #     # asynchronous. The proper solution is to make the similarity search
-    #     # asynchronous in the vector store implementations.
-    #     func = partial(self.similarity_search, query, k=k, **kwargs)
-    #     return await asyncio.get_event_loop().run_in_executor(None, func)
-
-    def similarity_search_with_score(
-        # self, *args: Any, **kwargs: Any
-        self,
-        query: str,
-        k: int = DEFAULT_K,
-        fetch_k: int = DEFAULT_FETCH_K,
-        filter: Optional[dict[str, List]] = None,
-        **kwargs: Any,
-    ) -> List[Tuple[Document, float]]:
-        # raise NotImplementedError
-        query_embedding = self.get_embedding_from_query(query)
-        results = self.query_by_embeddings(
-            query_embeddings=[query_embedding],
-            k=k,
-            fetch_k=fetch_k,
-            filter=filter,
-            **kwargs,
-        )
-
-        return self.results2documents_and_scores(results)
-
-    # optional: add custom async implementations
-    # async def asimilarity_search_with_score(
-    #     self, *args: Any, **kwargs: Any
-    # ) -> List[Tuple[Document, float]]:
-    #     # This is a temporary workaround to make the similarity search
-    #     # asynchronous. The proper solution is to make the similarity search
-    #     # asynchronous in the vector store implementations.
-    #     func = partial(self.similarity_search_with_score, *args, **kwargs)
-    #     return await asyncio.get_event_loop().run_in_executor(None, func)
-
-    def similarity_search_by_vector(
-        # self, embedding: List[float], k: int = DEFAULT_K, **kwargs: Any
-        self,
-        embedding: List[float],
-        k: int = DEFAULT_K,
-        fetch_k: int = DEFAULT_FETCH_K,
-        filter: Optional[dict[str, List]] = None,
-        **kwargs: Any,
-    ) -> List[Document]:
-        # raise NotImplementedError
-        """Return docs most similar to embedding vector.
-
-        Args:
-            embedding: Embedding to look up documents similar to.
-            k: Number of Documents to return.
-            fetch_k: Number of candidates to fetch for knn (>= k).
-            filter: Filter by metadata. Defaults to None.
-            **kwargs: Arguments to pass to the search method.
-
-        Returns:
-            List of Documents most similar to the query vector.
-        """
-        start_time = time.time()
-        results = self.query_by_embeddings(
-            query_embeddings=[embedding],
-            k=k,
-            fetch_k=fetch_k,
-            filter=filter,
-            **kwargs,
-        )
-        logger.info(
-            f"VDMS similarity search took {time.time() - start_time:0.4f} seconds"
-        )
-
-        final_docs = []
-        for this_result in results:
-            resp, _ = this_result
-            try:
-                descriptor_entities = resp[0]["FindDescriptor"].get("entities", [])
-            except ValueError:
-                descriptor_entities = []
-            if isinstance(descriptor_entities, dict):
-                final_docs.append(self.descriptor2document(descriptor_entities))
-            elif isinstance(descriptor_entities, list):
-                for descriptor in descriptor_entities:
-                    final_docs.append(self.descriptor2document(descriptor))
-            else:
-                pass
-        return final_docs
-
-    # optional: add custom async implementations
-    # async def asimilarity_search_by_vector(
-    #     self, embedding: List[float], k: int = 4, **kwargs: Any
-    # ) -> List[Document]:
-    #     # This is a temporary workaround to make the similarity search
-    #     # asynchronous. The proper solution is to make the similarity search
-    #     # asynchronous in the vector store implementations.
-    #     func = partial(self.similarity_search_by_vector, embedding, k=k, **kwargs)
-    #     return await asyncio.get_event_loop().run_in_executor(None, func)
-
-    def max_marginal_relevance_search(
-        self,
-        query: str,
-        k: int = DEFAULT_K,
-        fetch_k: int = DEFAULT_FETCH_K,
-        lambda_mult: float = 0.5,
-        filter: Optional[dict[str, List]] = None,
-        **kwargs: Any,
-    ) -> List[Document]:
-        # raise NotImplementedError
-        """Returns similar documents to the query that also have diversity
-
-        This algorithm balances relevance and diversity in the search results.
-
-        Args:
-            query: Text to look up documents similar to.
-            k: Number of Documents to return. Defaults to 4.
-            fetch_k: Number of Documents to fetch to pass to MMR algorithm.
-            lambda_mult: Number between 0 and 1 that determines the degree
-                of diversity among the results with 0 corresponding
-                to maximum diversity and 1 to minimum diversity.
-                Defaults to 0.5.
-            **kwargs: Arguments to pass to the search method.
-
-        Returns:
-            List of Document objects ordered by decreasing similarity/diversty.
-        """
-        query_embedding = self.get_embedding_from_query(query)
-        return self.max_marginal_relevance_search_by_vector(
-            query_embedding, k, fetch_k, lambda_mult, filter, **kwargs
-        )
-
-    # optional: add custom async implementations
-    # async def amax_marginal_relevance_search(
-    #     self,
-    #     query: str,
-    #     k: int = 4,
-    #     fetch_k: int = 20,
-    #     lambda_mult: float = 0.5,
-    #     **kwargs: Any,
-    # ) -> List[Document]:
-    #     # This is a temporary workaround to make the similarity search
-    #     # asynchronous. The proper solution is to make the similarity search
-    #     # asynchronous in the vector store implementations.
-    #     func = partial(
-    #         self.max_marginal_relevance_search,
-    #         query,
-    #         k=k,
-    #         fetch_k=fetch_k,
-    #         lambda_mult=lambda_mult,
-    #         **kwargs,
-    #     )
-    #     return await asyncio.get_event_loop().run_in_executor(None, func)
-
-    def max_marginal_relevance_search_by_vector(
-        self,
-        embedding: List[float],
-        k: int = DEFAULT_K,
-        fetch_k: int = DEFAULT_FETCH_K,
-        lambda_mult: float = 0.5,
-        filter: Optional[dict[str, List]] = None,
-        **kwargs: Any,
-    ) -> List[Document]:
-        # raise NotImplementedError
-        """Return docs selected using the maximal marginal relevance.
-
-        Maximal marginal relevance optimizes for similarity to query AND diversity
-        among selected documents.
-
-        Args:
-            embedding: Embedding vector to search for.
-            k: Number of Documents to return.
-            fetch_k: Number of Documents to fetch to pass to MMR algorithm.
-            lambda_mult: Number between 0 and 1 that determines the degree
-                        of diversity among the results with 0 corresponding
-                        to maximum diversity and 1 to minimum diversity.
-                        Defaults to 0.5.
-            filter (Optional[dict[str, str]]): Filter by metadata. Defaults to None.
-
-        Returns:
-            List of Documents selected by maximal marginal relevance.
-        """
-        start_time = time.time()
-        results = self.query_by_embeddings(
-            query_embeddings=[embedding],
-            k=k,
-            fetch_k=fetch_k,
-            filter=filter,
-            include=["metadatas", "documents", "distances", "embeddings"],
-        )
-
-        if len(results[0][1]) == 0:
-            # No results returned
-            return []
-        else:
-            embedding_list = [
-                list(self.utils.bytes2embedding(result)) for result in results[0][1]
-            ]
-
-            mmr_selected = maximal_marginal_relevance(
-                np.array(embedding, dtype=np.float32),
-                embedding_list,
-                k=k,
-                lambda_mult=lambda_mult,
-            )
-
-            logger.info(
-                f"VDMS similarity search mmr took {time.time() - start_time:0.4f} secs"
-            )
-            candidates = self.results2documents(results)
-            return [r for i, r in enumerate(candidates) if i in mmr_selected]
-
-    # optional: add custom async implementations
-    # async def amax_marginal_relevance_search_by_vector(
-    #     self,
-    #     embedding: List[float],
-    #     k: int = 4,
-    #     fetch_k: int = 20,
-    #     lambda_mult: float = 0.5,
-    #     **kwargs: Any,
-    # ) -> List[Document]:
-    #     raise NotImplementedError
-
     @classmethod
     def from_texts(
         cls,
@@ -582,7 +502,6 @@ class VDMS(VectorStore):
         metadatas: Optional[List[dict]] = None,
         **kwargs: Any,
     ) -> VDMS:
-        # raise NotImplementedError
         """Creates a new vector store from a list of texts
 
         Args:
@@ -593,15 +512,11 @@ class VDMS(VectorStore):
             ids: Optional list of IDs associated with the texts.
             collection_name (str): Name of the collection to create.
             kwargs: Additional keyword arguments.
-                - "delete_existing" will delete matching ids prior to adding
-                    new document with same id (True); else add with duplicate
-                    id (False) [Default: True]
 
         Returns:
             VectorStore: VectorStore initialized from texts and embeddings.
         """
         client: vdms.vdms = kwargs.pop("client")
-        delete_existing: bool = kwargs.pop("delete_existing", True)
         collection_name = kwargs.get("collection_name", DEFAULT_COLLECTION_NAME)
         ids = kwargs.get("ids", None)
 
@@ -619,74 +534,14 @@ class VDMS(VectorStore):
             ids = [str(uuid.uuid4()) for _ in texts]
 
         metadatas = metadatas if metadatas is not None else [{} for _ in ids]
-        vdms_store._len_check_if_sized(ids, texts, "ids", "texts")
-        vdms_store._len_check_if_sized(ids, metadatas, "ids", "metadatas")
-
-        # Remove IDs if exist
-        remove_ids = [doc.id for doc in vdms_store.get_by_ids(ids) if doc.id]
-        if len(remove_ids) > 0:
-            if delete_existing:
-                vdms_store.delete(ids=remove_ids, **kwargs)
-                remove_ids = []
-            else:
-                pstr = "[!] Embeddings skipped for following ids because "
-                pstr += f"already exists: {remove_ids}. Retry with "
-                pstr += "'delete_existing' set to True"
-                logger.info(pstr)
-
-        valid_ids = []
-        valid_texts = []
-        valid_metadatas = []
-        for id, txt, meta in zip(ids, texts, metadatas):
-            if id not in remove_ids:
-                valid_ids.append(id)
-                valid_texts.append(txt)
-                valid_metadatas.append(meta)
 
         vdms_store.add_texts(
-            texts=valid_texts,
-            metadatas=valid_metadatas,
-            ids=valid_ids,
+            texts=texts,
+            metadatas=metadatas,
+            ids=ids,
             **kwargs,
         )
         return vdms_store
-
-    # optional: add custom async implementations
-    # @classmethod
-    # async def afrom_texts(
-    #     cls: Type[VST],
-    #     texts: List[str],
-    #     embedding: Embeddings,
-    #     metadatas: Optional[List[dict]] = None,
-    #     **kwargs: Any,
-    # ) -> VST:
-    #     return await asyncio.get_running_loop().run_in_executor(
-    #         None, partial(cls.from_texts, **kwargs), texts, embedding, metadatas
-    #     )
-
-    def _select_relevance_score_fn(self) -> Callable[[float], float]:
-        # raise NotImplementedError
-        """
-        The 'correct' relevance function
-        may differ depending on a few things, including:
-        - the distance / similarity metric used by the VectorStore
-        - the scale of your embeddings (OpenAI's are unit normed. Many others are not!)
-        - embedding dimensionality
-        - etc.
-        """
-        if self.override_relevance_score_fn is not None:
-            return self.override_relevance_score_fn
-
-        # Default strategy is to rely on distance strategy provided
-        # in vector store constructor
-        if self.distance_strategy.lower() in ["ip", "l2"]:
-            return lambda x: x
-        else:
-            raise ValueError(
-                "No supported normalization function"
-                f" for distance_strategy of {self.distance_strategy}."
-                "Consider providing relevance_score_fn to VDMS constructor."
-            )
 
     def add_documents(self, documents: list[Document], **kwargs: Any) -> list[str]:
         """Add or update documents in the vector store.
@@ -696,9 +551,6 @@ class VDMS(VectorStore):
             kwargs: Additional keyword arguments.
                 - if kwargs contains ids and documents contain ids,
                     the ids in the kwargs will receive precedence.
-                - "delete_existing" will delete matching ids prior to adding
-                    new document with same id (True); else add with duplicate
-                    id (False) [Default: True]
 
         Returns:
             List of IDs of the added texts.
@@ -707,7 +559,6 @@ class VDMS(VectorStore):
             ValueError: If the number of ids does not match the number of documents.
         """
         # GET IDS & FORMAT DOCUMENTS
-        delete_existing: bool = kwargs.pop("delete_existing", True)
         ids = kwargs.pop("ids", None)
         if ids is not None:
             # Get IDs
@@ -729,8 +580,6 @@ class VDMS(VectorStore):
         else:
             # Get Documents
             documents_ = documents
-
-        if ids is None:
             ids = []
             for doc in documents_:
                 if hasattr(doc, "id") and doc.id is not None:
@@ -740,78 +589,14 @@ class VDMS(VectorStore):
                 else:
                     ids.append(str(uuid.uuid4()))
 
-        # Remove IDs if exist
-        remove_ids = [doc.id for doc in self.get_by_ids(ids) if doc.id]
-        if len(remove_ids) > 0:
-            if delete_existing:
-                self.delete(ids=remove_ids, **kwargs)
-                remove_ids = []
-            else:
-                pstr = "[!] Embeddings skipped for following ids because "
-                pstr += f"already exists: {remove_ids}\nCan retry with "
-                pstr += "'delete_existing' set to True"
-                logger.info(pstr)
-        valid_ids = []
         texts = []
         metadatas = []
         for id, doc in zip(ids, documents_):
-            if id not in remove_ids:
-                valid_ids.append(id)
-                texts.append(doc.page_content)
-                metadatas.append(doc.metadata)
+            texts.append(doc.page_content)
+            metadatas.append(doc.metadata)
 
-        kwargs["ids"] = valid_ids
+        kwargs["ids"] = ids
         return self.add_texts(texts, metadatas, **kwargs)
-
-    def get_by_ids(self, ids: Sequence[str], /) -> list[Document]:
-        """Get selected documents from vector store by their IDs.
-
-        Args:
-            ids: List of ids to retrieve.
-
-        Returns:
-            documents: List of Document objects found in the vector store.
-        """
-
-        collection_name = self.collection_name
-        all_constraints = []
-        for id in ids:
-            constraints = {
-                LANGCHAIN_ID_PROPERTY: ["==", str(id)],
-            }
-            all_constraints.append(constraints)
-
-        results = {"list": self.utils.get_properties(collection_name)}
-
-        docs = []
-        for constraint in all_constraints:
-            query = self.utils.add_descriptor(
-                "FindDescriptor",
-                collection_name,
-                label=None,
-                ref=None,
-                props=None,
-                link=None,
-                k_neighbors=None,
-                constraints=constraint,
-                results=results,
-            )
-
-            response, _ = self.utils.run_vdms_query([query])
-
-            if "FindDescriptor" in response[0]:
-                this_docs = [
-                    self.descriptor2document(doc)
-                    for doc in response[0]["FindDescriptor"].get("entities", [])
-                ]
-                docs.extend(this_docs)
-        return docs
-
-    @property
-    def embeddings(self) -> Embeddings:
-        return self.embedding
-
-    """ BACKWARD COMPATIBLE FUNCS """
 
     @classmethod
     def from_documents(
@@ -871,208 +656,77 @@ class VDMS(VectorStore):
             ids (list[str]): List of ids of the document to update.
             documents (list[Document]): List of documents to update.
         """
-        kwargs["delete_existing"] = True
         self.add_documents(documents=documents, ids=ids, **kwargs)
-        # collection_name = kwargs.pop("collection_name", cls.collection_name)
-        # if collection_name == cls.collection_name:
-        #     cls.add_documents(documents=documents, ids=ids, **kwargs)
-        # else:
-        #     vectorstore = cls(
-        #         client=cls._client,
-        #         embedding=cls.embedding,
-        #         collection_name=collection_name,
-        #         **kwargs,
-        #     )
-        #     vectorstore.add_documents(documents, ids=ids, **kwargs)
 
-    def max_marginal_relevance_search_by_vector_with_score(
+    def upsert(
         self,
-        embedding: list[float],
-        k: int = DEFAULT_K,
-        fetch_k: int = DEFAULT_FETCH_K,
-        lambda_mult: float = 0.5,
-        filter: Optional[dict[str, list]] = None,
+        documents: List[Document],
+        /,
         **kwargs: Any,
-    ) -> list[tuple[Document, float]]:
-        """Return docs selected using the maximal marginal relevance.
-
-        Maximal marginal relevance optimizes for similarity to query AND diversity
-        among selected documents.
+    ) -> UpsertResponse:
+        """Update/Insert documents to the vectorstore.
 
         Args:
-            embedding: Embedding vector to search for.
-            k: Number of Documents to return.
-            fetch_k: Number of Documents to fetch to pass to MMR algorithm.
-            lambda_mult: Number between 0 and 1 that determines the degree
-                        of diversity among the results with 0 corresponding
-                        to maximum diversity and 1 to minimum diversity.
-                        Defaults to 0.5.
-            filter (Optional[dict[str, str]]): Filter by metadata. Defaults to None.
+            ids: IDs to update
+            documents (List[Document]): Documents to add to the vectorstore.
 
         Returns:
-            List of Documents selected by maximal marginal relevance.
+            List[str]: IDs of the added texts.
         """
-        start_time = time.time()
-        results = self.query_by_embeddings(
-            query_embeddings=[embedding],
-            k=k,
-            fetch_k=fetch_k,
-            filter=filter,
-            include=["metadatas", "documents", "distances", "embeddings"],
-        )
+        ids: Optional[List[str]] = kwargs.pop("ids", None)
 
-        if len(results[0][1]) == 0:
-            # No results returned
-            return []
+        if documents is None or len(documents) == 0:
+            logger.debug("No documents to upsert.")
+            return {
+                "succeeded": self.add_documents(documents=documents, **kwargs),
+                "failed": [],
+            }
+
+        try:
+            if ids is not None and len(ids):
+                self.delete(ids=ids)
+            # return self.add_documents(documents=documents, **kwargs)
+            return {
+                "succeeded": self.add_documents(documents=documents, **kwargs),
+                "failed": [],
+            }
+        except Exception as e:
+            logger.error(f"Failed to upsert entities: {e}")
+            raise e
+
+    def add_embeddings(
+        self,
+        texts: list[str],
+        embeddings: list[list[float]],
+        metadatas: Optional[list[dict]] = None,
+        **kwargs: Any,
+    ) -> list[str]:
+        if metadatas is None:
+            metadatas = [{} for _ in texts]
         else:
-            embedding_list = [
-                list(self.utils.bytes2embedding(result)) for result in results[0][1]
-            ]
+            metadatas = [self.utils.validate_vdms_properties(m) for m in metadatas]
 
-            mmr_selected = maximal_marginal_relevance(
-                np.array(embedding, dtype=np.float32),
-                embedding_list,
-                k=k,
-                lambda_mult=lambda_mult,
-            )
+        # Populate IDs
+        ids = kwargs.pop("ids", None)
+        if ids is None:
+            ids = []
+            for meta in metadatas:
+                if LANGCHAIN_ID_PROPERTY in meta:
+                    ids.append(meta[LANGCHAIN_ID_PROPERTY])
+                else:
+                    ids.append(str(uuid.uuid4()))
 
-            logger.info(
-                f"VDMS similarity search mmr took {time.time() - start_time:0.4f} secs"
-            )
-            candidates = self.results2documents_and_scores(results)
-            return [(r, s) for i, (r, s) in enumerate(candidates) if i in mmr_selected]
+        if "batch_size" not in kwargs:
+            kwargs["batch_size"] = DEFAULT_INSERT_BATCH_SIZE
 
-    def max_marginal_relevance_search_with_score(
-        self,
-        query: str,
-        k: int = DEFAULT_K,
-        fetch_k: int = DEFAULT_FETCH_K,
-        lambda_mult: float = 0.5,
-        filter: Optional[dict[str, List]] = None,
-        **kwargs: Any,
-    ) -> List[Tuple[Document, float]]:
-        """Returns similar documents to the query that also have diversity
-
-        This algorithm balances relevance and diversity in the search results.
-
-        Args:
-            query: Text to look up documents similar to.
-            k: Number of Documents to return. Defaults to 4.
-            fetch_k: Number of Documents to fetch to pass to MMR algorithm.
-            lambda_mult: Number between 0 and 1 that determines the degree
-                of diversity among the results with 0 corresponding
-                to maximum diversity and 1 to minimum diversity.
-                Defaults to 0.5.
-            **kwargs: Arguments to pass to the search method.
-
-        Returns:
-            List of Document objects ordered by decreasing similarity/diversty.
-        """
-        query_embedding = self.get_embedding_from_query(query)
-        return self.max_marginal_relevance_search_by_vector_with_score(
-            query_embedding, k, fetch_k, lambda_mult, filter, **kwargs
-        )
-
-    def similarity_search_with_score_by_vector(
-        self,
-        embedding: List[float],
-        k: int = DEFAULT_K,
-        fetch_k: int = DEFAULT_FETCH_K,
-        filter: Optional[dict[str, List]] = None,
-        **kwargs: Any,
-    ) -> List[Tuple[Document, float]]:
-        """
-        Return docs most similar to embedding vector and similarity score.
-
-        Args:
-            embedding (List[float]): Embedding to look up documents similar to.
-            k (int): Number of Documents to return. Defaults to 3.
-            fetch_k (int): Number of candidates to fetch for knn (>= k).
-            filter (Optional[Dict[str, str]]): Filter by metadata. Defaults to None.
-
-        Returns:
-            List[Tuple[Document, float]]: List of documents most similar to
-            the query text. Lower score represents more similarity.
-        """
-
-        # kwargs["normalize_distance"] = True
-
-        results = self.query_by_embeddings(
-            query_embeddings=[embedding],
-            n_results=k,
-            fetch_k=fetch_k,
-            filter=filter,
+        return self.add_from(
+            texts=texts,
+            embeddings=embeddings,
+            ids=ids,
+            metadatas=metadatas,
             **kwargs,
         )
-        return self.results2documents_and_scores(results)
-
-    def similarity_search_with_relevance_scores(
-        self,
-        query: str,
-        k: int = DEFAULT_K,
-        fetch_k: int = DEFAULT_FETCH_K,
-        filter: Optional[dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> List[Tuple[Document, float]]:
-        """Return docs and their similarity scores on a scale from 0 to 1.
-
-        0 is dissimilar, 1 is most similar.
-
-        Args:
-            query: Input text.
-            k (int): Number of Documents to return. Defaults to 3.
-            fetch_k (int): Number of candidates to fetch for knn (>= k).
-            filter (Optional[Dict[str, str]]): Filter by metadata. Defaults to None.
-            **kwargs: kwargs to be passed to similarity search. Should include:
-                score_threshold: Optional, a floating point value between 0 to 1 to
-                    filter the resulting set of retrieved docs.
-
-        Returns:
-            List of Tuples of (doc, similarity_score).
-        """
-        score_threshold = kwargs.pop("score_threshold", None)
-
-        if self.override_relevance_score_fn is None:
-            # Scales 0 to 1
-            kwargs["normalize_distance"] = True
-
-        docs_and_scores = self.similarity_search_with_score(
-            query=query,
-            k=k,
-            fetch_k=fetch_k,
-            filter=filter,
-            **kwargs,
-        )
-
-        if any(
-            similarity < 0.0 or similarity > 1.0 for _, similarity in docs_and_scores
-        ):
-            logger.warning(
-                f"Relevance scores must be between 0 and 1, got {docs_and_scores}",
-                stacklevel=2,
-            )
-
-        docs_and_rel_scores: List[Any] = []
-        for doc, score in docs_and_scores:
-            if self.override_relevance_score_fn is None:
-                # Lower is better to Higher is better
-                similarity = 1.0 - score
-            else:
-                similarity = self.override_relevance_score_fn(score)
-
-            if (score_threshold is None) or (
-                score_threshold is not None and similarity >= score_threshold
-            ):
-                docs_and_rel_scores.append((doc, similarity))
-
-        if len(docs_and_rel_scores) == 0:
-            e_msg = "No relevant docs were retrieved using the relevance score"
-            if score_threshold is not None:
-                e_msg += f" threshold {score_threshold}"
-            logger.warning(e_msg)
-        return docs_and_rel_scores
-
-    """ IMAGES """
+        # return inserted_ids
 
     def add_images(
         self,
@@ -1098,7 +752,7 @@ class VDMS(VectorStore):
             List of ids from adding images into the vector store.
         """
         # Map from uris to blobs to base64
-        b64_texts = [self.encode_image(image_path=uri) for uri in uris]
+        b64_texts = [encode_image(image_path=uri) for uri in uris]
 
         if add_path and metadatas:
             for midx, uri in enumerate(uris):
@@ -1119,8 +773,6 @@ class VDMS(VectorStore):
             **kwargs,
         )
         return inserted_ids
-
-    """ VIDEOS """
 
     def add_videos(
         self,
@@ -1169,98 +821,487 @@ class VDMS(VectorStore):
         )
         return inserted_ids
 
-    """ EMBEDDING FUNCS """
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        if isinstance(self.embedding, Embeddings):
-            return self.embedding.embed_documents(texts)
-        else:
-            p_str = "Must provide `embedding` which is expected"
-            p_str += " to be an Embeddings object"
-            raise ValueError(p_str)
-
-    def embed_video(self, paths: List[str], **kwargs: Any) -> List[List[float]]:
-        if self.embedding is not None and hasattr(self.embedding, "embed_video"):
-            return self.embedding.embed_video(paths=paths, **kwargs)
-        else:
-            raise ValueError(
-                "Must provide `embedding` which has attribute `embed_video`"
-            )
-
-    def embed_image(self, uris: List[str]) -> List[List[float]]:
-        if self.embedding is not None and hasattr(self.embedding, "embed_image"):
-            return self.embedding.embed_image(uris=uris)
-        else:
-            raise ValueError(
-                "Must provide `embedding` which has attribute `embed_image`"
-            )
-
-    def embed_query(self, text: str) -> List[float]:
-        if isinstance(self.embedding, Embeddings):
-            return self.embedding.embed_query(text)
-        else:
-            raise ValueError(
-                "Must provide `embedding` which is expected"
-                " to be an Embeddings object"
-            )
-
-    def add_embeddings(
+    def add_from(
         self,
         texts: list[str],
         embeddings: list[list[float]],
+        ids: list[str],
         metadatas: Optional[list[dict]] = None,
         **kwargs: Any,
     ) -> list[str]:
-        if metadatas is None:
-            metadatas = [{} for _ in texts]
-        else:
-            metadatas = [self.utils.validate_vdms_properties(m) for m in metadatas]
+        # Get initial properties
+        inserted_ids: list[str] = []
+        batch_size = int(kwargs.get("batch_size", DEFAULT_INSERT_BATCH_SIZE))
+        total_count = len(texts)
 
-        # Populate IDs
-        ids = kwargs.pop("ids", None)
-        if ids is None:
-            ids = []
-            for meta in metadatas:
-                if LANGCHAIN_ID_PROPERTY in meta:
-                    ids.append(meta[LANGCHAIN_ID_PROPERTY])
-                else:
-                    ids.append(str(uuid.uuid4()))
+        for start_idx in range(0, total_count, batch_size):
+            end_idx = min(start_idx + batch_size, total_count)
 
-        if "batch_size" not in kwargs:
-            kwargs["batch_size"] = DEFAULT_INSERT_BATCH_SIZE
+            batch_texts = texts[start_idx:end_idx]
+            batch_embedding_vectors = embeddings[start_idx:end_idx]
+            batch_ids = ids[start_idx:end_idx]
 
-        return self.add_from(
-            texts=texts,
-            embeddings=embeddings,
-            ids=ids,
-            metadatas=metadatas,
-            **kwargs,
+            if metadatas:
+                batch_metadatas = metadatas[start_idx:end_idx]
+
+            try:
+                result_ids = self.add_batch(
+                    self.collection_name,
+                    embeddings=batch_embedding_vectors,
+                    texts=batch_texts,
+                    metadatas=batch_metadatas,
+                    ids=batch_ids,
+                )
+
+                inserted_ids.extend(result_ids)
+            except Exception as e:
+                logger.error(
+                    "Failed to insert batch starting at entity: %s-%s",
+                    start_idx,
+                    end_idx - 1,
+                )
+                raise e
+
+        # Update Properties
+        self.push_update_properties(
+            self.collection_name,
         )
-        # return inserted_ids
+        return inserted_ids
 
-    def get_embedding_from_query(self, query: str) -> list[float]:
-        if not os_path.isfile(query) and hasattr(self.embedding, "embed_query"):
-            query_embedding: list[float] = self.embed_query(query)
-        elif os_path.isfile(query) and hasattr(self.embedding, "embed_image"):
-            query_embedding = self.embed_image(uris=[query])[0]
-        elif os_path.isfile(query) and hasattr(self.embedding, "embed_video"):
-            query_embedding = self.embed_video(paths=[query])[0]
-        else:
-            error_msg = f"Could not generate embedding for query '{query}'."
-            error_msg += "If using path for image or video, verify embedding model "
-            error_msg += "has callable functions 'embed_image' or 'embed_video'."
-            raise ValueError(error_msg)
-        return query_embedding
+    def add_batch(
+        self,
+        collection_name: str,
+        texts: list[str],
+        embeddings: list[list[float]],
+        metadatas: Optional[list[dict]] = None,
+        ids: Optional[list[str]] = None,
+    ) -> list:
+        _len_check_if_sized(texts, embeddings, "texts", "embeddings")
 
-    def encode_image(self, image_path: str) -> str:
-        with open(image_path, "rb") as f:
-            blob = f.read()
-            return base64.b64encode(blob).decode("utf-8")
+        metadatas = metadatas if metadatas is not None else [{} for _ in texts]
+        _len_check_if_sized(texts, metadatas, "texts", "metadatas")
 
-    def decode_image(self, base64_image: str) -> bytes:
-        return base64.b64decode(base64_image)
+        ids = ids if ids is not None else [str(uuid.uuid4()) for _ in texts]
+        _len_check_if_sized(texts, ids, "texts", "ids")
+
+        extended_emb: list[Any] = []
+        batch_properties: list[dict] = []
+        all_queries: list[dict] = []
+        for meta, emb, doc, id in zip(metadatas, embeddings, texts, ids):
+            extended_emb.extend(emb)
+            batch_properties.append(self.get_props_from_metadata(doc, meta, id))
+        all_queries = []
+
+        all_blobs = [self.utils.embedding2bytes(extended_emb)]
+        all_queries.append(
+            self.utils.add_descriptor(
+                "AddDescriptor",
+                collection_name,
+                label=None,
+                ref=None,
+                props=batch_properties,
+                link=None,
+                k_neighbors=None,
+                constraints=None,
+                results=None,
+            )
+        )
+        response, _ = self.utils.run_vdms_query(all_queries, all_blobs)
+
+        try:
+            return ids if response[0]["AddDescriptor"]["status"] == 0 else []
+        except Exception as e:
+            if "OutOfJournalSpace" in response[0]["info"]:
+                try:
+                    logger.info("OutOfJournalSpace: Splitting batch in half")
+                    old_batch = len(all_queries)
+                    new_batch_size = old_batch // 2
+                    emb_len = len(emb)
+                    for start_idx in range(0, old_batch, new_batch_size):
+                        end_idx_blob = min(
+                            start_idx * emb_len + new_batch_size - 1, len(all_blobs)
+                        )
+                        blobs = all_blobs[start_idx * emb_len : end_idx_blob]
+
+                        end_idx = min(start_idx + new_batch_size - 1, old_batch)
+                        queries = all_queries[start_idx:end_idx]
+                        response, _ = self.utils.run_vdms_query(queries, blobs)
+                except Exception:
+                    raise ValueError(f"Lower batch_size to < {old_batch} and rerun")
+
+                return ids if response[0]["AddDescriptor"]["status"] == 0 else []
+            else:
+                logger.info(f"Exception[in add_batch]: {e}")
+                logger.info("Returning []")
+                return []
 
     """ SEARCH """
+
+    def similarity_search_with_relevance_scores(
+        self,
+        query: str,
+        k: int = DEFAULT_K,
+        fetch_k: int = DEFAULT_FETCH_K,
+        filter: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> List[Tuple[Document, float]]:
+        """Return docs and their similarity scores on a scale from 0 to 1.
+
+        0 is dissimilar, 1 is most similar.
+
+        Args:
+            query: Input text.
+            k (int): Number of Documents to return. Defaults to 3.
+            fetch_k (int): Number of candidates to fetch for knn (>= k).
+            filter (Optional[Dict[str, str]]): Filter by metadata. Defaults to None.
+            **kwargs: kwargs to be passed to similarity search. Should include:
+                score_threshold: Optional, a floating point value between 0 to 1 to
+                    filter the resulting set of retrieved docs.
+
+        Returns:
+            List of Tuples of (doc, similarity_score).
+        """
+        score_threshold = kwargs.pop("score_threshold", None)
+
+        if self.override_relevance_score_fn is None:
+            # Scales 0 to 1
+            kwargs["normalize_distance"] = True
+
+        docs_and_scores = self.similarity_search_with_score(
+            query=query,
+            k=k,
+            fetch_k=fetch_k,
+            filter=filter,
+            **kwargs,
+        )
+
+        docs_and_rel_scores: List[Tuple[Document, float]] = []
+        for doc, score in docs_and_scores:
+            if score < 0.0 or score > 1.0:
+                logger.warning(
+                    f"Relevance scores must be between 0 and 1, got {score}",
+                    stacklevel=2,
+                )
+            if self.override_relevance_score_fn is None:
+                # Lower is better to Higher is better
+                similarity = 1.0 - score
+            else:
+                similarity = self.override_relevance_score_fn(score)
+
+            if (score_threshold is None) or (
+                score_threshold is not None and similarity >= score_threshold
+            ):
+                docs_and_rel_scores.append((doc, similarity))
+
+        if len(docs_and_rel_scores) == 0:
+            e_msg = "No relevant docs were retrieved using the relevance score"
+            if score_threshold is not None:
+                e_msg += f" threshold {score_threshold}"
+            logger.warning(e_msg)
+        return docs_and_rel_scores
+
+    def similarity_search(
+        self,
+        query: str,
+        k: int = DEFAULT_K,
+        fetch_k: int = DEFAULT_FETCH_K,
+        filter: Optional[dict[str, List]] = None,
+        **kwargs: Any,
+    ) -> List[Document]:
+        """Return docs most similar to query.
+
+        Args:
+            query: Query string to search for.
+            k: Number of Documents to return.
+            fetch_k: Number of candidates to fetch for knn (>= k).
+            filter: Filter by metadata. Defaults to None.
+            **kwargs: Arguments to pass to the search method.
+
+        Returns:
+            List of Documents most similar to the query.
+        """
+        query_embedding = self.get_embedding_from_query(query)
+        return self.similarity_search_by_vector(
+            query_embedding, k, fetch_k=fetch_k, filter=filter, **kwargs
+        )
+
+    def similarity_search_by_vector(
+        self,
+        embedding: List[float],
+        k: int = DEFAULT_K,
+        fetch_k: int = DEFAULT_FETCH_K,
+        filter: Optional[dict[str, List]] = None,
+        **kwargs: Any,
+    ) -> List[Document]:
+        """Return docs most similar to embedding vector.
+
+        Args:
+            embedding: Embedding to look up documents similar to.
+            k: Number of Documents to return.
+            fetch_k: Number of candidates to fetch for knn (>= k).
+            filter: Filter by metadata. Defaults to None.
+            **kwargs: Arguments to pass to the search method.
+
+        Returns:
+            List of Documents most similar to the query vector.
+        """
+        final_docs = self.similarity_search_with_score_by_vector(
+            embedding=embedding,
+            k=k,
+            fetch_k=fetch_k,
+            filter=filter,
+            **kwargs,
+        )
+        return [doc for doc, _ in final_docs]
+
+    def similarity_search_with_score(
+        self,
+        query: str,
+        k: int = DEFAULT_K,
+        fetch_k: int = DEFAULT_FETCH_K,
+        filter: Optional[dict[str, List]] = None,
+        **kwargs: Any,
+    ) -> List[Tuple[Document, float]]:
+        """Return docs most similar to query.
+
+        Args:
+            query: Query string to search for.
+            k: Number of Documents to return.
+            fetch_k: Number of candidates to fetch for knn (>= k).
+            filter: Filter by metadata. Defaults to None.
+            **kwargs: Arguments to pass to the search method.
+
+        Returns:
+            List[Tuple[Document, float]]: List of documents most similar to
+                the query text. Lower score represents more similarity.
+        """
+        query_embedding = self.get_embedding_from_query(query)
+        return self.similarity_search_with_score_by_vector(
+            query_embedding, k, fetch_k=fetch_k, filter=filter, **kwargs
+        )
+
+    def similarity_search_with_score_by_vector(
+        self,
+        embedding: List[float],
+        k: int = DEFAULT_K,
+        fetch_k: int = DEFAULT_FETCH_K,
+        filter: Optional[dict[str, List]] = None,
+        **kwargs: Any,
+    ) -> List[Tuple[Document, float]]:
+        """
+        Return docs most similar to embedding vector and similarity score.
+
+        Args:
+            embedding (List[float]): Embedding to look up documents similar to.
+            k (int): Number of Documents to return. Defaults to 3.
+            fetch_k (int): Number of candidates to fetch for knn (>= k).
+            filter (Optional[Dict[str, str]]): Filter by metadata. Defaults to None.
+
+        Returns:
+            List[Tuple[Document, float]]: List of documents most similar to
+            the embedding. Lower score represents more similarity.
+        """
+
+        # kwargs["normalize_distance"] = True
+        start_time = time.time()
+        results = self.query_by_embeddings(
+            query_embeddings=[embedding],
+            k=k,
+            fetch_k=fetch_k,
+            filter=filter,
+            **kwargs,
+        )
+        logger.info(
+            f"VDMS similarity search took {time.time() - start_time:0.4f} seconds"
+        )
+        return self.results2documents_and_scores(results)
+
+    def get_mmr_indices(
+        self,
+        embedding: list[float],
+        k: int = DEFAULT_K,
+        fetch_k: int = DEFAULT_FETCH_K,
+        filter: Optional[dict[str, list]] = None,
+        lambda_mult: float = 0.5,
+        **kwargs: Any,
+    ) -> tuple[list[Any], list[int]]:
+        results = self.query_by_embeddings(
+            query_embeddings=[embedding],
+            k=k,
+            fetch_k=fetch_k,
+            filter=filter,
+            include=["metadatas", "documents", "distances", "embeddings"],
+        )
+
+        resp, resp_arr = results[0]
+        if len(resp_arr) == 0:
+            # No results returned
+            return [], []
+
+        embedding_list = [
+            list(self.utils.bytes2embedding(result)) for result in resp_arr
+        ]
+
+        mmr_selected = maximal_marginal_relevance(
+            np.array(embedding, dtype=np.float32),
+            embedding_list,
+            k=k,
+            lambda_mult=lambda_mult,
+        )
+        return results, mmr_selected
+
+    def max_marginal_relevance_search(
+        self,
+        query: str,
+        k: int = DEFAULT_K,
+        fetch_k: int = DEFAULT_FETCH_K,
+        lambda_mult: float = 0.5,
+        filter: Optional[dict[str, List]] = None,
+        **kwargs: Any,
+    ) -> List[Document]:
+        """Returns similar documents to the query that also have diversity
+
+        This algorithm balances relevance and diversity in the search results.
+
+        Args:
+            query: Text to look up documents similar to.
+            k: Number of Documents to return. Defaults to 4.
+            fetch_k: Number of Documents to fetch to pass to MMR algorithm.
+            lambda_mult: Number between 0 and 1 that determines the degree
+                of diversity among the results with 0 corresponding
+                to maximum diversity and 1 to minimum diversity.
+                Defaults to 0.5.
+            **kwargs: Arguments to pass to the search method.
+
+        Returns:
+            List of Document objects ordered by decreasing similarity/diversty.
+        """
+        query_embedding = self.get_embedding_from_query(query)
+        return self.max_marginal_relevance_search_by_vector(
+            query_embedding, k, fetch_k, lambda_mult, filter, **kwargs
+        )
+
+    def max_marginal_relevance_search_by_vector(
+        self,
+        embedding: List[float],
+        k: int = DEFAULT_K,
+        fetch_k: int = DEFAULT_FETCH_K,
+        lambda_mult: float = 0.5,
+        filter: Optional[dict[str, List]] = None,
+        **kwargs: Any,
+    ) -> List[Document]:
+        """Return docs selected using the maximal marginal relevance.
+
+        Maximal marginal relevance optimizes for similarity to query AND diversity
+        among selected documents.
+
+        Args:
+            embedding: Embedding vector to search for.
+            k: Number of Documents to return.
+            fetch_k: Number of Documents to fetch to pass to MMR algorithm.
+            lambda_mult: Number between 0 and 1 that determines the degree
+                        of diversity among the results with 0 corresponding
+                        to maximum diversity and 1 to minimum diversity.
+                        Defaults to 0.5.
+            filter (Optional[dict[str, str]]): Filter by metadata. Defaults to None.
+
+        Returns:
+            List of Documents selected by maximal marginal relevance.
+        """
+        start_time = time.time()
+        results, mmr_selected = self.get_mmr_indices(
+            query_embeddings=[embedding],
+            k=k,
+            fetch_k=fetch_k,
+            filter=filter,
+            lambda_mult=lambda_mult,
+            **kwargs,
+        )
+
+        logger.info(f"VDMS mmr search took {time.time() - start_time:0.4f} secs")
+        documents = self.results2documents(results)
+        reordered_docs: List[Document] = reorder_mmr_documents(documents, mmr_selected)
+        return reordered_docs
+
+    def max_marginal_relevance_search_with_score(
+        self,
+        query: str,
+        k: int = DEFAULT_K,
+        fetch_k: int = DEFAULT_FETCH_K,
+        lambda_mult: float = 0.5,
+        filter: Optional[dict[str, List]] = None,
+        **kwargs: Any,
+    ) -> List[Tuple[Document, float]]:
+        """Returns similar documents to the query that also have diversity
+
+        This algorithm balances relevance and diversity in the search results.
+
+        Args:
+            query: Text to look up documents similar to.
+            k: Number of Documents to return. Defaults to 4.
+            fetch_k: Number of Documents to fetch to pass to MMR algorithm.
+            lambda_mult: Number between 0 and 1 that determines the degree
+                of diversity among the results with 0 corresponding
+                to maximum diversity and 1 to minimum diversity.
+                Defaults to 0.5.
+            **kwargs: Arguments to pass to the search method.
+
+        Returns:
+            List of Document objects ordered by decreasing similarity/diversty.
+        """
+        query_embedding = self.get_embedding_from_query(query)
+        return self.max_marginal_relevance_search_with_score_by_vector(
+            query_embedding,
+            k=k,
+            fetch_k=fetch_k,
+            filter=filter,
+            lambda_mult=lambda_mult,
+            **kwargs,
+        )
+
+    def max_marginal_relevance_search_with_score_by_vector(
+        self,
+        embedding: list[float],
+        k: int = DEFAULT_K,
+        fetch_k: int = DEFAULT_FETCH_K,
+        filter: Optional[dict[str, list]] = None,
+        lambda_mult: float = 0.5,
+        **kwargs: Any,
+    ) -> list[tuple[Document, float]]:
+        """Return docs selected using the maximal marginal relevance.
+
+        Maximal marginal relevance optimizes for similarity to query AND diversity
+        among selected documents.
+
+        Args:
+            embedding: Embedding vector to search for.
+            k: Number of Documents to return.
+            fetch_k: Number of Documents to fetch to pass to MMR algorithm.
+            lambda_mult: Number between 0 and 1 that determines the degree
+                        of diversity among the results with 0 corresponding
+                        to maximum diversity and 1 to minimum diversity.
+                        Defaults to 0.5.
+            filter (Optional[dict[str, str]]): Filter by metadata. Defaults to None.
+
+        Returns:
+            List of Documents selected by maximal marginal relevance.
+        """
+        start_time = time.time()
+        results, mmr_selected = self.get_mmr_indices(
+            query_embeddings=[embedding],
+            k=k,
+            fetch_k=fetch_k,
+            filter=filter,
+            lambda_mult=lambda_mult,
+            **kwargs,
+        )
+        logger.info(f"VDMS mmr search took {time.time() - start_time:0.4f} secs")
+
+        documents_and_scores = self.results2documents_and_scores(results)
+        reordered_docs_and_scores: list[tuple[Document, float]] = reorder_mmr_documents(
+            documents_and_scores, mmr_selected
+        )
+        return reordered_docs_and_scores
 
     def query_by_embeddings(
         self,
@@ -1330,42 +1371,70 @@ class VDMS(VectorStore):
 
         return all_responses
 
+    def get_by_ids(self, ids: Sequence[str], /) -> list[Document]:
+        """Get documents by their IDs.
+
+        Args:
+            ids: List of ids to retrieve.
+
+        Returns:
+            documents: List of Document objects found in the vectorstore.
+        """
+
+        collection_name = self.collection_name
+        all_constraints = []
+        for id in ids:
+            constraints = {
+                LANGCHAIN_ID_PROPERTY: ["==", str(id)],
+            }
+            all_constraints.append(constraints)
+
+        results = {"list": self.utils.get_properties(collection_name)}
+
+        docs = []
+        for constraint in all_constraints:
+            query = self.utils.add_descriptor(
+                "FindDescriptor",
+                collection_name,
+                label=None,
+                ref=None,
+                props=None,
+                link=None,
+                k_neighbors=None,
+                constraints=constraint,
+                results=results,
+            )
+
+            response, _ = self.utils.run_vdms_query([query])
+
+            if "FindDescriptor" in response[0]:
+                this_docs = [
+                    self.descriptor2document(doc)
+                    for doc in response[0]["FindDescriptor"].get("entities", [])
+                ]
+                docs.extend(this_docs)
+        return docs
+
     def results2documents(self, results: Any) -> list[Document]:
         return [doc for doc, _ in self.results2documents_and_scores(results)]
 
     def results2documents_and_scores(
         self, results: Any
     ) -> list[Tuple[Document, float]]:
-        final_res: list[Any] = []
-        try:
-            responses, blobs = results[0]
-            descriptor_entities = responses[0]["FindDescriptor"].get("entities", [])
-            if len(descriptor_entities) > 0:
-                for ent in descriptor_entities:
-                    distance = round(ent["_distance"], 10)
-                    txt_contents = ent[TEXT_PROPERTY]
-                    props = {
-                        mkey: mval
-                        for mkey, mval in ent.items()
-                        if (
-                            mval not in INVALID_METADATA_VALUE
-                            and mkey not in INVALID_DOC_METADATA_KEYS
-                        )
-                    }
-                    if LANGCHAIN_ID_PROPERTY in props:
-                        d_id = props.pop(LANGCHAIN_ID_PROPERTY)
+        final_docs: list[Any] = []
+        for this_result in results:
+            responses, _ = this_result
+            try:
+                descriptor_entities = responses[0]["FindDescriptor"].get("entities", [])
 
-                    final_res.append(
-                        (
-                            Document(
-                                page_content=txt_contents, metadata=props, id=d_id
-                            ),
-                            distance,
-                        )
+                for descriptor_entity in descriptor_entities:
+                    distance = round(descriptor_entity["_distance"], 10)
+                    final_docs.append(
+                        [self.descriptor2document(descriptor_entity), distance]
                     )
-        except Exception as e:
-            logger.warning(f"No results returned. Error while parsing results: {e}")
-        return final_res
+            except Exception as e:
+                logger.warning(f"No results returned. Error while parsing results: {e}")
+        return final_docs
 
     def descriptor2document(self, descriptor_entity: dict) -> Document:
         metadata = {}
@@ -1471,105 +1540,56 @@ class VDMS(VectorStore):
             logger.info("Returning []")
             return [], []
 
+    """ EMBEDDING FUNCS """
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if isinstance(self.embedding, Embeddings):
+            return self.embedding.embed_documents(texts)
+        else:
+            p_str = "Must provide `embedding` which is expected"
+            p_str += " to be an Embeddings object"
+            raise ValueError(p_str)
+
+    def embed_video(self, paths: List[str], **kwargs: Any) -> List[List[float]]:
+        if self.embedding is not None and hasattr(self.embedding, "embed_video"):
+            return self.embedding.embed_video(paths=paths, **kwargs)
+        else:
+            raise ValueError(
+                "Must provide `embedding` which has attribute `embed_video`"
+            )
+
+    def embed_image(self, uris: List[str]) -> List[List[float]]:
+        if self.embedding is not None and hasattr(self.embedding, "embed_image"):
+            return self.embedding.embed_image(uris=uris)
+        else:
+            raise ValueError(
+                "Must provide `embedding` which has attribute `embed_image`"
+            )
+
+    def embed_query(self, text: str) -> List[float]:
+        if isinstance(self.embedding, Embeddings):
+            return self.embedding.embed_query(text)
+        else:
+            raise ValueError(
+                "Must provide `embedding` which is expected"
+                " to be an Embeddings object"
+            )
+
+    def get_embedding_from_query(self, query: str) -> list[float]:
+        if not os_path.isfile(query) and hasattr(self.embedding, "embed_query"):
+            query_embedding: list[float] = self.embed_query(query)
+        elif os_path.isfile(query) and hasattr(self.embedding, "embed_image"):
+            query_embedding = self.embed_image(uris=[query])[0]
+        elif os_path.isfile(query) and hasattr(self.embedding, "embed_video"):
+            query_embedding = self.embed_video(paths=[query])[0]
+        else:
+            error_msg = f"Could not generate embedding for query '{query}'."
+            error_msg += "If using path for image or video, verify embedding model "
+            error_msg += "has callable functions 'embed_image' or 'embed_video'."
+            raise ValueError(error_msg)
+        return query_embedding
+
     """ OTHER FUNCS """
-
-    def _check_required_inputs(
-        self,
-        collection_name: str,
-        embedding_dimensions: Union[int, None],
-        **kwargs: Any,
-    ) -> None:
-        # Check Distance Metric
-        if self.distance_strategy not in AVAILABLE_DISTANCE_METRICS:
-            raise ValueError("distance_strategy must be either 'L2' or 'IP'")
-
-        # Check Engines
-        if self.similarity_search_engine not in AVAILABLE_ENGINES:
-            raise ValueError(
-                "engine must be either 'TileDBDense', 'TileDBSparse', "
-                + "'FaissFlat', 'FaissIVFFlat', 'FaissHNSWFlat', or 'Flinng'"
-            )
-
-        # Check Embedding Func is provided and store dimension size
-        if self.embedding is None:
-            raise ValueError("Must provide embedding function")
-
-        if embedding_dimensions is not None:
-            self.embedding_dimension = embedding_dimensions
-        elif self.embedding is not None and hasattr(self.embedding, "embed_query"):
-            self.embedding_dimension = len(
-                self.embedding.embed_query("This is a sample sentence.")
-            )
-        elif self.embedding is not None and (
-            hasattr(self.embedding, "embed_image")
-            or hasattr(self.embedding, "embed_video")
-        ):
-            dim_err_str = "Please define embedding_dimensions"
-            if hasattr(self.embedding, "model"):
-                try:
-                    self.embedding_dimension = (
-                        self.embedding.model.token_embedding.embedding_dim
-                    )
-                except ValueError:
-                    raise ValueError(dim_err_str)
-            else:
-                raise ValueError(dim_err_str)
-
-        # Check for properties
-        current_props = self.utils.get_properties(collection_name)
-        if hasattr(self, "collection_properties"):
-            missing_elements = list(
-                set(current_props) - set(self.collection_properties)
-            )  # element in current not in props
-            if len(missing_elements) > 0:
-                self.collection_properties.extend(missing_elements)
-        else:
-            self.collection_properties: list[str] = current_props
-
-        self.collection_properties.sort()
-
-    def _create_collection(self) -> None:
-        collection_name = self.collection_name
-        embedding_dimension = self.embedding_dimension
-        engine = self.similarity_search_engine
-        metric = self.distance_strategy
-
-        query = self.utils.add_descriptor_set(
-            "AddDescriptorSet",
-            collection_name,
-            embedding_dimension,
-            engine=getattr(engine, "value", engine),
-            metric=getattr(metric, "value", metric),
-        )
-
-        response, _ = self.utils.run_vdms_query([query])
-
-        if "FailedCommand" in response[0]:
-            raise ValueError(f"Failed to add collection {collection_name}")
-
-        if response[0]["AddDescriptorSet"]["status"] == 0:
-            status = "created"
-        else:
-            status = "exists"
-
-        logger.info(f"Descriptor set {collection_name} {status}")
-
-    def _len_check_if_sized(self, x: Any, y: Any, x_name: str, y_name: str) -> None:
-        """
-        Check that sizes of two variables are the same
-
-        Args:
-            x: Variable to compare
-            y: Variable to compare
-            x_name: Name for variable x
-            y_name: Name for variable y
-        """
-        if isinstance(x, Sized) and isinstance(y, Sized) and len(x) != len(y):
-            raise ValueError(
-                f"{x_name} and {y_name} expected to be equal length but "
-                f"len({x_name})={len(x)} and len({y_name})={len(y)}"
-            )
-        return
 
     def check_and_update_properties(self) -> None:
         if self.updated_properties_flag:
@@ -1579,53 +1599,6 @@ class VDMS(VectorStore):
             if self.collection_properties != pushed_props:
                 self.collection_properties = pushed_props
             self.updated_properties_flag = False
-
-    def add_from(
-        self,
-        texts: list[str],
-        embeddings: list[list[float]],
-        ids: list[str],
-        metadatas: Optional[list[dict]] = None,
-        **kwargs: Any,
-    ) -> list[str]:
-        # Get initial properties
-        inserted_ids: list[str] = []
-        batch_size = int(kwargs.get("batch_size", DEFAULT_INSERT_BATCH_SIZE))
-        total_count = len(texts)
-
-        for start_idx in range(0, total_count, batch_size):
-            end_idx = min(start_idx + batch_size, total_count)
-
-            batch_texts = texts[start_idx:end_idx]
-            batch_embedding_vectors = embeddings[start_idx:end_idx]
-            batch_ids = ids[start_idx:end_idx]
-
-            if metadatas:
-                batch_metadatas = metadatas[start_idx:end_idx]
-
-            try:
-                result_ids = self.add_batch(
-                    self.collection_name,
-                    embeddings=batch_embedding_vectors,
-                    texts=batch_texts,
-                    metadatas=batch_metadatas,
-                    ids=batch_ids,
-                )
-
-                inserted_ids.extend(result_ids)
-            except Exception as e:
-                logger.error(
-                    "Failed to insert batch starting at entity: %s-%s",
-                    start_idx,
-                    end_idx - 1,
-                )
-                raise e
-
-        # Update Properties
-        self.push_update_properties(
-            self.collection_name,
-        )
-        return inserted_ids
 
     def push_update_properties(
         self,
@@ -1646,71 +1619,6 @@ class VDMS(VectorStore):
             )
             response, _ = self.utils.run_vdms_query(all_queries, [blob_arr])
             self.updated_properties_flag = True
-
-    def add_batch(
-        self,
-        collection_name: str,
-        texts: list[str],
-        embeddings: list[list[float]],
-        metadatas: Optional[list[dict]] = None,
-        ids: Optional[list[str]] = None,
-    ) -> list:
-        self._len_check_if_sized(texts, embeddings, "texts", "embeddings")
-
-        metadatas = metadatas if metadatas is not None else [{} for _ in texts]
-        self._len_check_if_sized(texts, metadatas, "texts", "metadatas")
-
-        ids = ids if ids is not None else [str(uuid.uuid4()) for _ in texts]
-        self._len_check_if_sized(texts, ids, "texts", "ids")
-
-        extended_emb: list[Any] = []
-        batch_properties: list[dict] = []
-        for meta, emb, doc, id in zip(metadatas, embeddings, texts, ids):
-            extended_emb.extend(emb)
-            batch_properties.append(self.get_props_from_metadata(doc, meta, id))
-        all_blobs = [self.utils.embedding2bytes(extended_emb)]
-        all_queries = [
-            self.utils.add_descriptor(
-                "AddDescriptor",
-                collection_name,
-                label=None,
-                ref=None,
-                props=batch_properties,
-                link=None,
-                k_neighbors=None,
-                constraints=None,
-                results=None,
-            )
-        ]
-
-        response, _ = self.utils.run_vdms_query(all_queries, all_blobs)
-
-        try:
-            return ids if response[0]["AddDescriptor"]["status"] == 0 else []
-        except Exception as e:
-            if "OutOfJournalSpace" in response[0]["info"]:
-                try:
-                    logger.info("OutOfJournalSpace: Splitting batch in half")
-                    old_batch = len(all_queries)
-                    new_batch_size = old_batch // 2
-                    emb_len = len(emb)
-                    for start_idx in range(0, old_batch, new_batch_size):
-                        end_idx_blob = min(
-                            start_idx * emb_len + new_batch_size - 1, len(all_blobs)
-                        )
-                        blobs = all_blobs[start_idx * emb_len : end_idx_blob]
-
-                        end_idx = min(start_idx + new_batch_size - 1, old_batch)
-                        queries = all_queries[start_idx:end_idx]
-                        response, _ = self.utils.run_vdms_query(queries, blobs)
-                except Exception:
-                    raise ValueError(f"Lower batch_size to < {old_batch} and rerun")
-
-                return ids if response[0]["AddDescriptor"]["status"] == 0 else []
-            else:
-                logger.info(f"Exception[in add_batch]: {e}")
-                logger.info("Returning []")
-                return []
 
     def get_props_from_metadata(
         self,
@@ -1739,81 +1647,6 @@ class VDMS(VectorStore):
                 self.collection_properties.append(k)
         self.collection_properties.sort()
         return props
-
-    def batch_delete(
-        self,
-        collection_name: str,
-        constraints: dict,
-        ids: Optional[list[str]] = None,
-        batch_size: int = DEFAULT_INSERT_BATCH_SIZE,
-    ) -> list:
-        resp_dict: dict = {}
-        resp_dict.setdefault(
-            "FindDescriptor", {"entities": list(), "returned": 0, "status": 0}
-        )
-        new_response = [resp_dict]
-
-        if ids is None:
-            # return new_response
-            # FIND ALL
-            query = self.utils.add_descriptor(
-                "FindDescriptor",
-                collection_name,
-                label=None,
-                ref=None,
-                props=None,
-                link=None,
-                k_neighbors=None,
-                constraints=constraints,
-                results={"list": self.collection_properties},
-            )
-            response, _ = self.utils.run_vdms_query([query])
-
-            for res in response:
-                if "FindDescriptor" in res:
-                    new_response[0]["FindDescriptor"]["entities"].extend(
-                        res["FindDescriptor"]["entities"]
-                    )
-        else:
-            for start_idx in range(0, len(ids), batch_size):
-                end_idx = min(start_idx + batch_size, len(ids))
-                batch_ids = ids[start_idx:end_idx]
-
-                all_queries = []
-                for i in batch_ids:
-                    tmp_ = {LANGCHAIN_ID_PROPERTY: ["==", i]}
-                    if constraints is not None:
-                        tmp_.update(constraints)
-
-                    query = self.utils.add_descriptor(
-                        "FindDescriptor",
-                        collection_name,
-                        label=None,
-                        ref=None,
-                        props=None,
-                        link=None,
-                        k_neighbors=None,
-                        constraints=tmp_,
-                        results={"list": self.collection_properties},
-                    )
-
-                    all_queries.append(query)
-
-                if all_queries == []:
-                    return new_response
-
-                response, _ = self.utils.run_vdms_query(all_queries)
-
-                for res in response:
-                    if "FindDescriptor" in res:
-                        new_response[0]["FindDescriptor"]["entities"].extend(
-                            res["FindDescriptor"]["entities"]
-                        )
-
-        new_response[0]["FindDescriptor"]["returned"] = len(
-            new_response[0]["FindDescriptor"]["entities"]
-        )
-        return new_response
 
 
 # Vectorstore Client Connector
@@ -1891,6 +1724,20 @@ class VDMS_Utils:
 
         if "Find" in command_str and constraints not in INVALID_METADATA_VALUE:
             entity["constraints"] = constraints
+
+            if k_neighbors is None and constraints is not None:
+                lid_count = sum(
+                    [1 for c in constraints.get(LANGCHAIN_ID_PROPERTY, []) if c == "=="]
+                )
+
+                id_count = sum([1 for c in constraints.get("id", []) if c == "=="])
+
+                limit = min(lid_count, id_count) if lid_count > 0 else id_count
+                if limit > 0:
+                    if results is not None:
+                        results["limit"] = limit
+                    else:
+                        results = {"limit": int(limit)}
 
         if "Find" in command_str and results not in INVALID_METADATA_VALUE:
             entity["results"] = results
@@ -2132,58 +1979,36 @@ class VDMS_Utils:
             elif LANGCHAIN_ID_PROPERTY not in results["list"]:
                 results["list"].append(LANGCHAIN_ID_PROPERTY)
 
-            # (1) Find docs satisfy constraints
             query = self.add_descriptor(
                 command_str,
                 setname,
                 constraints=constraints,
                 results=results,
+                k_neighbors=fetch_k,
             )
-            response, response_array = self.run_vdms_query([query])
-            if command_str in response[0] and response[0][command_str]["returned"] > 0:
-                ids_of_interest = [
-                    ent[LANGCHAIN_ID_PROPERTY]
-                    for ent in response[0][command_str]["entities"]
-                ]
-            else:
-                return [], []
-
-            # (2) Find top fetch_k results
-            response, response_array = self.get_k_candidates(
-                setname=setname,
-                k=fetch_k,
-                results=results,
-                all_blobs=all_blobs,
+            response, response_array = self.run_vdms_query([query], all_blobs)
+            descriptor_entities = response[0][command_str].get("entities", [])
+            response_array = response_array[:k_neighbors]
+            response[0][command_str]["entities"] = descriptor_entities[:k_neighbors]
+            response[0][command_str]["returned"] = len(
+                response[0][command_str]["entities"]
             )
-            if command_str not in response[0] or (
-                command_str in response[0] and response[0][command_str]["returned"] == 0
-            ):
-                return [], []
 
-            # (3) Intersection of (1) & (2) using ids
-            new_entities = []
-            for ent in response[0][command_str]["entities"]:
-                if ent[LANGCHAIN_ID_PROPERTY] in ids_of_interest:
-                    new_entities.append(ent)
-                if len(new_entities) == k_neighbors:
-                    break
-            response[0][command_str]["entities"] = new_entities
-            response[0][command_str]["returned"] = len(new_entities)
-            response_array = response_array[: len(new_entities)]
-            if len(new_entities) < k_neighbors:
-                p_str = "Returned items < k_neighbors; Try increasing fetch_k"
+            if response[0][command_str]["returned"] < k_neighbors:
+                p_str = "Returned items < K; Try increasing fetch_k"
                 logger.warning(p_str)
 
         if normalize_distance:
+            # descriptor_entities = response[0][command_str].get("entities", [])
             min_dist = 0.0
             max_dist = max(
                 [
                     ent["_distance"]
-                    for ent in response[0][command_str]["entities"]
+                    for ent in descriptor_entities
                     if ent["_distance"] != np.inf
                 ]
             )
-            for ent_idx, ent in enumerate(response[0][command_str]["entities"]):
+            for ent_idx, ent in enumerate(descriptor_entities):
                 try:
                     ent["_distance"] = (ent["_distance"] - min_dist) / (
                         max_dist - min_dist
