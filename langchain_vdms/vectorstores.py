@@ -1210,7 +1210,7 @@ class VDMS(VectorStore):
         """
         start_time = time.time()
         results, mmr_selected = self.get_mmr_indices(
-            query_embeddings=[embedding],
+            embedding=[embedding],
             k=k,
             fetch_k=fetch_k,
             filter=filter,
@@ -1288,7 +1288,7 @@ class VDMS(VectorStore):
         """
         start_time = time.time()
         results, mmr_selected = self.get_mmr_indices(
-            query_embeddings=[embedding],
+            embedding=[embedding],
             k=k,
             fetch_k=fetch_k,
             filter=filter,
@@ -1999,7 +1999,7 @@ class VDMS_Utils:
                 logger.warning(p_str)
 
         if normalize_distance:
-            # descriptor_entities = response[0][command_str].get("entities", [])
+            descriptor_entities = response[0][command_str].get("entities", [])
             min_dist = 0.0
             max_dist = max(
                 [
