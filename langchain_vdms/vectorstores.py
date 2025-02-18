@@ -1210,7 +1210,7 @@ class VDMS(VectorStore):
         """
         start_time = time.time()
         results, mmr_selected = self.get_mmr_indices(
-            embedding=[embedding],
+            embedding=embedding,
             k=k,
             fetch_k=fetch_k,
             filter=filter,
@@ -1288,7 +1288,7 @@ class VDMS(VectorStore):
         """
         start_time = time.time()
         results, mmr_selected = self.get_mmr_indices(
-            embedding=[embedding],
+            embedding=embedding,
             k=k,
             fetch_k=fetch_k,
             filter=filter,
