@@ -517,7 +517,7 @@ class VDMS(VectorStore):
             VectorStore: VectorStore initialized from texts and embeddings.
         """
         client: vdms.vdms = kwargs.pop("client")
-        collection_name = kwargs.get("collection_name", DEFAULT_COLLECTION_NAME)
+        collection_name = kwargs.pop("collection_name", DEFAULT_COLLECTION_NAME)
         ids = kwargs.get("ids", None)
 
         if "batch_size" not in kwargs:
