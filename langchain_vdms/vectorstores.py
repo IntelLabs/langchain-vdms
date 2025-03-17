@@ -55,7 +55,7 @@ DEFAULT_FETCH_K = (
 )  # Number of Documents to fetch to pass to knn when filters applied.
 INVALID_METADATA_VALUE = ["Missing property", None, {}]  # type: list
 DEFAULT_PROPERTIES = ["_distance", LANGCHAIN_ID_PROPERTY, TEXT_PROPERTY]
-INVALID_DOC_METADATA_KEYS = ["_distance", TEXT_PROPERTY, "blob"]
+INVALID_DOC_METADATA_KEYS = ["_distance", "blob"]
 
 DISTANCE_METRICS = Literal[
     "L2",  # Euclidean Distance
@@ -1957,20 +1957,20 @@ class VDMS_Utils:
             # K results returned
             response, response_array = self.get_k_candidates(
                 setname=setname,
-                k=fetch_k,
+                k=k_neighbors,
                 results=results,
                 all_blobs=all_blobs,
             )
 
-            if (
-                len(response) > 0
-                and command_str in response[0]
-                and "entities" in response[0][command_str]
-            ):
-                new_entities = response[0][command_str]["entities"][:k_neighbors]
-                response[0][command_str]["entities"] = new_entities
-                response[0][command_str]["returned"] = len(new_entities)
-                response_array = response_array[: len(new_entities)]
+            # if (
+            #     len(response) > 0
+            #     and command_str in response[0]
+            #     and "entities" in response[0][command_str]
+            # ):
+            #     new_entities = response[0][command_str]["entities"][:k_neighbors]
+            #     response[0][command_str]["entities"] = new_entities
+            #     response[0][command_str]["returned"] = len(new_entities)
+            #     response_array = response_array[: len(new_entities)]
         else:
             if results is None:
                 results = {"list": [LANGCHAIN_ID_PROPERTY]}
@@ -1979,6 +1979,7 @@ class VDMS_Utils:
             elif LANGCHAIN_ID_PROPERTY not in results["list"]:
                 results["list"].append(LANGCHAIN_ID_PROPERTY)
 
+            # (1) Find docs satisfy constraints
             query = self.add_descriptor(
                 command_str,
                 setname,
@@ -1986,15 +1987,34 @@ class VDMS_Utils:
                 results=results,
                 k_neighbors=fetch_k,
             )
-            response, response_array = self.run_vdms_query([query], all_blobs)
-            descriptor_entities = response[0][command_str].get("entities", [])
-            response_array = response_array[:k_neighbors]
-            response[0][command_str]["entities"] = descriptor_entities[:k_neighbors]
-            response[0][command_str]["returned"] = len(
-                response[0][command_str]["entities"]
-            )
+            response, response_array = self.run_vdms_query([query])
+            if command_str in response[0] and response[0][command_str]["returned"] > 0:
+                ids_of_interest = [
+                    ent["id"] for ent in response[0][command_str]["entities"]
+                ]
+            else:
+                return [], []
 
-            if response[0][command_str]["returned"] < k_neighbors:
+            # (2) Find top fetch_k results
+            response, response_array = self.get_k_candidates(
+                setname, fetch_k, results, all_blobs
+            )
+            if command_str not in response[0] or (
+                command_str in response[0] and response[0][command_str]["returned"] == 0
+            ):
+                return [], []
+
+            # (3) Intersection of (1) & (2) using ids
+            new_entities: List[dict] = []
+            descriptor_entities = response[0][command_str].get("entities", [])
+            for ent in descriptor_entities:
+                if ent["id"] in ids_of_interest:
+                    new_entities.append(ent)
+                if len(new_entities) == k_neighbors:
+                    break
+            response[0][command_str]["entities"] = new_entities
+            response[0][command_str]["returned"] = len(new_entities)
+            if len(new_entities) < k_neighbors:
                 p_str = "Returned items < K; Try increasing fetch_k"
                 logger.warning(p_str)
 
