@@ -1148,6 +1148,7 @@ class VDMS(VectorStore):
             k=k,
             lambda_mult=lambda_mult,
         )
+        # mmr_selected = [x for x in mmr_selected if x != -1]
         return results, mmr_selected
 
     def max_marginal_relevance_search(
@@ -1451,14 +1452,14 @@ class VDMS(VectorStore):
     def descriptor2document(self, descriptor_entity: dict) -> Document:
         metadata = {}
         d_id = None
-        txt_contents = None
+        txt_contents = ""
         for k, v in descriptor_entity.items():
             if k not in INVALID_DOC_METADATA_KEYS and v not in INVALID_METADATA_VALUE:
                 metadata[k] = v
         if LANGCHAIN_ID_PROPERTY in metadata:
             d_id = metadata.pop(LANGCHAIN_ID_PROPERTY)
-        # if TEXT_PROPERTY in d:
-        txt_contents = descriptor_entity[TEXT_PROPERTY]
+        if TEXT_PROPERTY in descriptor_entity:
+            txt_contents = descriptor_entity[TEXT_PROPERTY]
         doc = Document(page_content=txt_contents, metadata=metadata, id=d_id)
         return doc
 
