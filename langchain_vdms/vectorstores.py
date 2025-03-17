@@ -1220,6 +1220,8 @@ class VDMS(VectorStore):
 
         logger.info(f"VDMS mmr search took {time.time() - start_time:0.4f} secs")
         documents = self.results2documents(results)
+        print("mmr_selected: ", mmr_selected)
+        print("documents: ", documents)
         reordered_docs: List[Document] = reorder_mmr_documents(documents, mmr_selected)
         return reordered_docs
 
