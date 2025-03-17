@@ -122,6 +122,7 @@ def reorder_mmr_documents(
         # Function can return -1 index
         if idx == -1:
             break
-        else:
+        # else:
+        elif len(documents) > idx:
             reordered_docs.append(documents[idx])
     return reordered_docs

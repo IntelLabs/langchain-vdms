@@ -1220,10 +1220,13 @@ class VDMS(VectorStore):
 
         logger.info(f"VDMS mmr search took {time.time() - start_time:0.4f} secs")
         documents = self.results2documents(results)
-        print("mmr_selected: ", mmr_selected)
-        print("documents: ", documents)
-        reordered_docs: List[Document] = reorder_mmr_documents(documents, mmr_selected)
-        return reordered_docs
+        logger.info("mmr_selected: ", mmr_selected)
+        logger.info("documents: ", documents)
+        if len(documents) > 0:
+            reordered_docs: List[Document] = reorder_mmr_documents(documents, mmr_selected)
+            return reordered_docs
+        else:
+            return documents
 
     def max_marginal_relevance_search_with_score(
         self,
@@ -1300,10 +1303,17 @@ class VDMS(VectorStore):
         logger.info(f"VDMS mmr search took {time.time() - start_time:0.4f} secs")
 
         documents_and_scores = self.results2documents_and_scores(results)
-        reordered_docs_and_scores: list[tuple[Document, float]] = reorder_mmr_documents(
-            documents_and_scores, mmr_selected
-        )
-        return reordered_docs_and_scores
+        # reordered_docs_and_scores: list[tuple[Document, float]] = reorder_mmr_documents(
+        #     documents_and_scores, mmr_selected
+        # )
+        # return reordered_docs_and_scores
+        logger.info("mmr_selected: ", mmr_selected)
+        logger.info("documents: ", documents_and_scores)
+        if len(documents_and_scores) > 0:
+            reordered_docs_and_scores: list[tuple[Document, float]] = reorder_mmr_documents(documents_and_scores, mmr_selected)
+            return reordered_docs_and_scores
+        else:
+            return documents_and_scores
 
     def query_by_embeddings(
         self,
