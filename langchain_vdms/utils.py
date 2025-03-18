@@ -120,9 +120,14 @@ def reorder_mmr_documents(
     reordered_docs = []
     for idx in mmr_selected:
         # Function can return -1 index
-        if idx == -1:
-            break
-        # else:
-        elif len(documents) > idx:
-            reordered_docs.append(documents[idx])
+        # if idx == -1:
+        #     break
+        # # else:
+        # elif len(documents) > idx:
+        #     reordered_docs.append(documents[idx])
+        if idx != -1:
+            try:
+                reordered_docs.append(documents[idx])
+            except Exception:
+                pass
     return reordered_docs
