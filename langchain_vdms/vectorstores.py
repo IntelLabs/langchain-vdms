@@ -799,7 +799,7 @@ class VDMS(VectorStore):
             List of ids from adding videos into the vector store.
         """
         if texts is None:
-            texts = ["" for _ in paths]
+            texts = paths  #["" for _ in paths]
 
         if add_path and metadatas:
             for midx, path in enumerate(paths):
