@@ -82,7 +82,7 @@ class VDMS(VectorStore):
     different distance metrics and engines. The vector stores must have a
     unique collection_name (DescriptorSet).
 
-    Visit https://github.com/IntelLabs/vdms/wiki for more information.
+    Visit https://intellabs.github.io/vdms for more information.
 
     IT IS HIGHLY SUGGESTED TO NORMALIZE YOUR DATA.
 
