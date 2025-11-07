@@ -1,6 +1,10 @@
-# langchain-vdms
+# Langchain VDMS
 
-This package contains the LangChain integration with [VDMS](https://github.com/IntelLabs/vdms).
+![GitHub License](https://img.shields.io/github/license/IntelLabs/langchain-vdms)
+
+This package contains the [VDMS](https://github.com/IntelLabs/vdms) integration package for LangChain:
+
+- [langchain-vdms](https://pypi.org/project/langchain-vdms/) - An integration between LangChain and VDMS which enables retrievers and vector search for AI applications.
 
 ## Installation
 
@@ -52,3 +56,13 @@ vectorstore = VDMS(
 )
 ```
 See additional usage [here](https://python.langchain.com/docs/integrations/vectorstores/vdms/).
+
+
+## Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/IntelLabs/langchain-vdms/blob/main/CONTRIBUTING.md) for guidelines.
+
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](https://github.com/IntelLabs/langchain-vdms/blob/main/LICENSE) file for details.
