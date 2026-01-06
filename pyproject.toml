@@ -1,9 +1,52 @@
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-vdms"
+version = "0.2.0"
+description = "An integration package connecting VDMS and LangChain"
+authors = []
+requires-python = ">=3.10, <4.0"
+readme = "README.md"
+license = "MIT"
+dependencies = [
+    "langchain-core<2.0.0,>=1.0.0",
+    "vdms>=0.0.22",
+]
+repository = "https://github.com/IntelLabs/langchain-vdms"
+
+[project.urls]
+"Source Code" = "https://github.com/IntelLabs/langchain-vdms"
+"Release Notes" = "https://github.com/IntelLabs/langchain-vdms/releases"
+
+[dependency-groups]
+dev = ["langchain-core>=1.0.0,<2"]
+codespell = ["codespell>=2.2.6,<3"]
+lint = ["ruff>=0.5,<0.6"]
+test = [
+    "pytest>=7.4.3,<8",
+    "pytest-asyncio>=0.23.2,<0.24",
+    "pytest-socket>=0.7.0",
+    "pytest-watcher>=0.3.4,<0.4",
+    "types-pyyaml>=6.0.12.20240917,<7",
+    "langchain-core>=1.0.0,<2",
+    "langchain-tests>=1.0.0,<2",
+    "pytest-cov>=6.0.0,<7",
+]
+test_integration = []
+typing = [
+    "mypy>=1.10,<2",
+    "types-pyyaml>=6.0.12.20240917,<7",
+    "langchain-core>=1.0.0,<2",
+]
 
 [tool.coverage.run]
 omit = ["tests/*"]
+
+[tool.uv]
+default-groups = ["typing"]
+override-dependencies = ["urllib3>=2.6.0"]
 
 [tool.mypy]
 disallow_untyped_defs = "True"
@@ -11,65 +54,6 @@ disallow_untyped_defs = "True"
 [[tool.mypy.overrides]]
 module = ["vdms", "simsimd"]
 ignore_missing_imports = "True"
-
-[tool.poetry]
-name = "langchain-vdms"
-version = "0.2.0"
-description = "An integration package connecting VDMS and LangChain"
-authors = []
-readme = "README.md"
-repository = "https://github.com/IntelLabs/langchain-vdms"
-license = "MIT"
-
-[tool.poetry.dependencies]
-python = ">=3.10,<4.0"
-langchain-core = "<2.0.0,>=1.0.0"
-vdms = ">=0.0.22"
-
-[tool.poetry.urls]
-"Source Code" = "https://github.com/IntelLabs/langchain-vdms"
-"Release Notes" = "https://github.com/IntelLabs/langchain-vdms/releases"
-
-[tool.poetry.group.dev]
-optional = true
-
-[tool.poetry.group.dev.dependencies]
-langchain-core = {git = "https://github.com/langchain-ai/langchain.git", subdirectory = "libs/core"}
-
-[tool.poetry.group.codespell]
-optional = true
-
-[tool.poetry.group.codespell.dependencies]
-codespell = "^2.2.6"
-
-[tool.poetry.group.lint]
-optional = true
-
-[tool.poetry.group.lint.dependencies]
-ruff = "^0.5"
-
-[tool.poetry.group.test]
-optional = true
-
-[tool.poetry.group.test.dependencies]
-pytest = "^7.4.3"
-pytest-asyncio = "^0.23.2"
-pytest-socket = "^0.7.0"
-pytest-watcher = "^0.3.4"
-types-pyyaml = "^6.0.12.20240917"
-langchain-core = {git = "https://github.com/langchain-ai/langchain.git", subdirectory = "libs/core"}
-langchain-tests = "^1.0.0"
-pytest-cov = "^6.0.0"
-
-[tool.poetry.group.test_integration]
-optional = true
-
-[tool.poetry.group.test_integration.dependencies]
-
-[tool.poetry.group.typing.dependencies]
-mypy = "^1.10"
-types-pyyaml = "^6.0.12.20240917"
-langchain-core = {git = "https://github.com/langchain-ai/langchain.git", subdirectory = "libs/core"}
 
 [tool.pytest.ini_options]
 addopts = "--strict-markers --strict-config --durations=5 --cov=langchain_vdms --cov-report=html --cov-report=term"
